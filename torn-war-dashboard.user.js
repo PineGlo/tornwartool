@@ -327,10 +327,46 @@
    ********************************************************************/
   let soundOn = GM_getValue(K.SOUND_ON, CFG.SOUND_DEFAULT_ON);
 
+  const audioAlert = {
+    ctx: null,
+    unlocked: false,
+    lastBeepMs: 0,
+    MIN_GAP_MS: 220,
+  };
+
+  function ensureAudioContext() {
+    if (audioAlert.ctx) return audioAlert.ctx;
+    try {
+      audioAlert.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (_) {
+      audioAlert.ctx = null;
+    }
+    return audioAlert.ctx;
+  }
+
+  function armAudioContext() {
+    const ctx = ensureAudioContext();
+    if (!ctx) return;
+    if (ctx.state === "suspended") {
+      ctx.resume().then(() => { audioAlert.unlocked = true; }).catch(() => {});
+    } else {
+      audioAlert.unlocked = true;
+    }
+  }
+
+  window.addEventListener("pointerdown", () => armAudioContext(), { once: true });
+  window.addEventListener("keydown", () => armAudioContext(), { once: true });
+
   function beepFallback() {
     if (!soundOn) return;
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const now = Date.now();
+      if ((now - audioAlert.lastBeepMs) < audioAlert.MIN_GAP_MS) return;
+      audioAlert.lastBeepMs = now;
+
+      const ctx = ensureAudioContext();
+      if (!ctx) return;
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
       const o = ctx.createOscillator();
       const g = ctx.createGain();
       o.type = "sine";
@@ -339,7 +375,7 @@
       g.connect(ctx.destination);
       g.gain.value = 0.06;
       o.start();
-      setTimeout(() => { o.stop(); ctx.close(); }, 160);
+      setTimeout(() => { o.stop(); }, 160);
     } catch (_) {}
   }
 
@@ -353,6 +389,7 @@
     } catch (_) {
       beepFallback();
     }
+    if (soundOn) beepFallback();
     log("NOTIFY:", title, text);
   }
 
@@ -1424,9 +1461,19 @@
     return state || "—";
   }
 
+  function getEffectiveStatus(m, now = nowUnix()) {
+    const st = (m && m.status && m.status.state) ? m.status.state : "";
+    if (st === "Hospital" || st === "Jail") {
+      const until = (m && m.status) ? m.status.until : null;
+      if (typeof until === "number" && until <= now) return "Okay";
+    }
+    return st || "Unknown";
+  }
+
   function filterMember(m) {
     const name = ((m && m.name) ? m.name : "").toLowerCase();
-    const st = (m && m.status && m.status.state) ? m.status.state : "";
+    const now = nowUnix();
+    const st = getEffectiveStatus(m, now);
     const until = (m && m.status) ? m.status.until : null;
     const la = (m && m.last_action) ? m.last_action.status : "";
 
@@ -1441,7 +1488,7 @@
     if (FILTER.state === "out5") {
       if (!(st === "Hospital" || st === "Jail")) return false;
       if (typeof until !== "number") return false;
-      const left = until - nowUnix();
+      const left = until - now;
       return left > 0 && left <= CFG.HOT_UNDER_SEC;
     }
     if (FILTER.state === "okay") return st === "Okay";
@@ -1450,8 +1497,9 @@
   }
 
   function sortMembers(a, b) {
-    const sa = (a && a.status) ? a.status.state : "Unknown";
-    const sb = (b && b.status) ? b.status.state : "Unknown";
+    const now = nowUnix();
+    const sa = getEffectiveStatus(a, now);
+    const sb = getEffectiveStatus(b, now);
 
     const rank = (st) => {
       if (st === "Okay") return 0;
@@ -1819,6 +1867,7 @@
 
     const cache = Shared.cache;
     const age = Date.now() - (cache.ts || 0);
+    const now = nowUnix();
 
     if (age <= CFG.CACHE_STALE_WARN_MS) {
       UI.headerLive.classList.remove("stale");
@@ -1858,7 +1907,7 @@
     refreshSettingsFromStorage();
 
     UI.nextPops.innerHTML = pops.length ? pops.map(({ id, m }) => {
-      const left = m.status.until - nowUnix();
+      const left = m.status.until - now;
       const url = buildAttackUrl(id);
       const open = openAttackNewTab ? 'target="_blank" rel="noopener noreferrer"' : "";
       return `
@@ -1873,11 +1922,11 @@
     UI.rowNodes.clear();
 
     UI.tbody.innerHTML = entries.length ? entries.map(({ id, m }) => {
-      const st = (m && m.status) ? m.status.state : "—";
+      const st = getEffectiveStatus(m, now);
       const desc = (m && m.status) ? m.status.description : "";
       const until = (m && m.status) ? m.status.until : null;
       const la = (m && m.last_action) ? m.last_action.status : "—";
-      const left = (typeof until === "number") ? (until - nowUnix()) : null;
+      const left = (typeof until === "number") ? (until - now) : null;
 
       const timerText = ((st === "Hospital" || st === "Jail") && left != null && left > 0) ? fmtSeconds(left) : "";
       const hot = ((st === "Hospital" || st === "Jail") && left != null && left > 0 && left <= CFG.HOT_UNDER_SEC);
@@ -1957,6 +2006,7 @@
     if (UI.collapsed) return;
 
     const now = nowUnix();
+    let needsRender = false;
 
     // Pops
     if (UI.nextPops) {
@@ -1974,7 +2024,8 @@
       const m = Shared.cache.members && Shared.cache.members[userId];
       if (!m) continue;
 
-      const st = (m && m.status) ? m.status.state : "";
+      const stRaw = (m && m.status) ? m.status.state : "";
+      const st = getEffectiveStatus(m, now);
       const until = (m && m.status) ? m.status.until : null;
       const la = (m && m.last_action) ? m.last_action.status : "—";
       const desc = (m && m.status) ? m.status.description : "";
@@ -1985,6 +2036,7 @@
       }
 
       if (nodes.statusMain) nodes.statusMain.textContent = stateLabel(st, desc);
+      if ((stRaw === "Hospital" || stRaw === "Jail") && st === "Okay") needsRender = true;
 
       if ((st === "Hospital" || st === "Jail") && typeof until === "number") {
         const left = until - now;
@@ -2017,6 +2069,8 @@
     if (FFSC.enabled && UI.rowNodes.size) {
       uiApplyFFToRows(Array.from(UI.rowNodes.keys()));
     }
+
+    if (needsRender) renderFromCache();
   }
 
   /********************************************************************
